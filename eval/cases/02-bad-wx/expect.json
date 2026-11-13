@@ -1,0 +1,4 @@
+{
+  "status": "error",
+  "codes": ["QUOTE-HIT", "QUOTE-MISSING", "LOC-EXISTS", "BIDIR", "LEVEL"]
+}
