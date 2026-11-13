@@ -1,7 +1,7 @@
 ---
 name: distill-to-vault
 description: '把一个链接或一份文件蒸馏成带定位引用的结构化报告，按学科归档进本地 Obsidian 知识库（直接写 md 文件，不依赖 obsidian-cli）。每个锚点必须带原文逐字引文，并由 audit.py 自动校验定位存在性、引文逐字命中、正文与定位表双向一致；校验不通过不许写盘。用于：蒸馏 / 总结并入库 / 存到 Obsidian / 这篇公众号帮我整理 / 小红书笔记提炼 / 这个视频讲了什么并归档 / 论文或研报精读笔记 / distill this into my vault。不用于：把书或长视频拆成可执行 skill（用 cangjie-skill）；只要爆款标题、文案改写、起号选题（本 skill 不做营销文案）；只想要 PDF 纯文本提取（用 workbuddy-pdf）；只想要原子化卡片笔记。'
-version: 2.1.0
+version: 2.2.0
 display_name: '内容蒸馏入库'
 display_name_en: 'Distill to Vault'
 description_zh: '公众号/小红书/知乎/网页、抖音/视频号/B站短视频、论文与券商研报 → 带定位引用的蒸馏报告 → 按学科写入 Obsidian 知识库，并挂进总纲。'
