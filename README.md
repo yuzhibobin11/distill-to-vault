@@ -33,6 +33,8 @@ pip install requests yt-dlp faster-whisper "av==16.1.0"
 python scripts/fetch_text.py doctor
 ```
 
+**vault 不用手动配**：doctor 会自动认 `~/Documents/Obsidian` 这类常见库位置；认不出来才需要 `setx DISTILL_VAULT "你的库路径"`（它会打印可直接复制的命令）。写盘命令的 `--vault` 也因此可以省略。
+
 ## 用法
 
 ```
