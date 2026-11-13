@@ -104,8 +104,11 @@ python scripts\fetch_text.py transcribe <local-media> [--out-dir DIR] [--model t
 
 python scripts\audit.py verify <report.md> --src <content.md> [--segments seg.jsonl] [--json]
 python scripts\audit.py write  <draft.md>  --vault <dir> [--topic 学科] [--summary "一句话"] [--src ...] [--overwrite] [--force] [--json]
+python scripts\audit.py upgrade <old.md>   --src <content.md> [--apply] [--threshold 0.3] [--json]
 python scripts\audit.py eval   <cases_dir> [--json]
 ```
+
+`upgrade` 只解决旧笔记「有定位符、没引文」的体力活：按定位取原文、切句、按字面重合度排候选。**语义是否支撑结论仍需人判断**，`--apply` 后必须跑 verify 并在交付时说明哪些引文是机器挑的。
 
 产物：`meta.json`（schema 2：平台/标题/时间/字数/降级项 + `snapshot.sha256` + `content.sha256` + `safety`）＋ `content.md`（顶部 UNTRUSTED 隔离注释；每段 `[¶nnn]`；视频 `[mm:ss]`）＋（B 分支）`segments.jsonl`、`transcript.srt`。
 

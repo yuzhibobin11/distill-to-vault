@@ -130,6 +130,31 @@ def strip_noise(body: str) -> str:
     return body
 
 
+def is_example_anchor(line: str, pos: int, quote: str) -> bool:
+    """判断是不是「格式说明里的锚点示例」，例：> 定位：`[¶012]` = 第 12 段
+
+    判据三条同时成立：没有引文（裸定位）、在引用块里、被行内代码包着。
+    真的引用即便写在反引号里（有人爱这么排版）只要带引文就不算示例。
+    """
+    if quote:
+        return False
+    if not line.lstrip().startswith(">"):
+        return False
+    return any(s <= pos < e
+               for s, e in (x.span() for x in re.finditer(r"`[^`\n]*`", line)))
+
+
+def drop_example_anchors(body: str) -> str:
+    lines = []
+    for ln in body.splitlines():
+        if ln.lstrip().startswith(">"):
+            for m in reversed(list(d.ANCHOR_RE.finditer(ln))):
+                if is_example_anchor(ln, m.start(), m.group(2) or ""):
+                    ln = ln[:m.start()] + ln[m.end():]
+        lines.append(ln)
+    return "\n".join(lines)
+
+
 LOC_TABLE_HEAD = re.compile(r"^##\s*附[：:]\s*定位表", re.M)
 LOC_ROW = re.compile(
     r"^\|\s*\[?(" + d.LOCATOR + r")\]?\s*\|", re.M)
@@ -142,7 +167,8 @@ def anchor_planes(body: str) -> tuple[list[dict], list[dict]]:
         main, table = body[: m.start()], body[m.start():]
     else:
         main, table = body, ""
-    return d.parse_anchors(strip_noise(main)), d.parse_anchors(strip_noise(table))
+    return (d.parse_anchors(drop_example_anchors(strip_noise(main))),
+            d.parse_anchors(drop_example_anchors(strip_noise(table))))
 
 
 # ---------------------------------------------------------------- verify
@@ -569,6 +595,170 @@ def cmd_write(args) -> int:
     return d.OK
 
 
+# ---------------------------------------------------------------- upgrade
+
+_SENT_SPLIT = re.compile(
+    r"(?<=[。！？；!?;])"          # 中文标点与英文问号叹号
+    r"|(?<=\.)\s+(?=[A-Z0-9\"“(])"  # 英文句号：后面是空格加大写/数字/引号
+    r"|\n+"
+)
+
+
+def _noisy(s: str) -> bool:
+    """PDF 抽取残渣：邮箱、链接、符号占比过高的行，不该当引文候选。"""
+    if "@" in s or "http" in s.lower() or "www." in s.lower():
+        return True
+    solid = sum(1 for c in s if c.isalnum() or "\u4e00" <= c <= "\u9fff")
+    return solid / max(len(s), 1) < 0.5
+
+
+def _split_sentences(text: str) -> list[str]:
+    """切句，只留长度落在引文区间（8–160）内、且不是抽取残渣的完整句。"""
+    t = d.normalize(text)
+    out: list[str] = []
+
+    def push(x: str) -> None:
+        x = x.strip()
+        if d.QUOTE_MIN <= len(x) <= d.QUOTE_MAX and not _noisy(x):
+            out.append(x)
+
+    for seg in _SENT_SPLIT.split(t):
+        seg = (seg or "").strip()
+        if not seg:
+            continue
+        if len(seg) <= d.QUOTE_MAX:
+            push(seg)
+            continue
+        # 过长：按逗号再切，拼到上限
+        buf = ""
+        for piece in re.split(r"(?<=[，,])", seg):
+            if len(buf) + len(piece) > d.QUOTE_MAX:
+                push(buf)
+                buf = piece
+            else:
+                buf += piece
+        push(buf)
+    return out
+
+
+def _grams(s: str) -> set[str]:
+    s = re.sub(r"[^\w\u4e00-\u9fff]", "", s)
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _relevance(ctx: str, cand: str) -> float:
+    """候选句被结论覆盖的字符二元组比例。只用来排序，不当作证据。"""
+    a, b = _grams(ctx), _grams(cand)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(b)
+
+
+def cmd_upgrade(args) -> int:
+    """把只有定位符的旧锚点，按原文列出候选引文，供人工挑或批量回填。
+
+    这是「升级工具」不是「代笔」：候选只按字面重合排序，语义是否真的支撑
+    那条结论必须人来判断。--apply 会把高于阈值的候选直接写进报告，写完仍要
+    跑 verify，并且要在交付时说明哪些引文是机器挑的。
+    """
+    rep = Path(args.report)
+    if not rep.exists():
+        print(f"E_USAGE: 报告不存在 {rep}", file=sys.stderr)
+        return d.E_USAGE
+
+    raw = rep.read_text(encoding="utf-8")
+    src = Source(Path(args.src), Path(args.segments) if args.segments else None)
+    lines = raw.splitlines()
+
+    plan: list[dict] = []
+    missed: list[dict] = []
+    for no, ln in enumerate(lines, 1):
+        anchors = [a for a in d.parse_anchors(ln)
+                   if not is_example_anchor(ln, a["span"][0], a["quote"])]
+        if not anchors:
+            continue
+        ctx = d.ANCHOR_RE.sub("", ln)
+        for a in anchors:
+            if a["quote"]:
+                continue
+            frag, err = src.fragment(a["locator"])
+            if frag is None:
+                missed.append({"line": no, "locator": a["locator"], "error": err})
+                continue
+            scored = sorted(((_relevance(ctx, c), c) for c in _split_sentences(frag)),
+                            key=lambda x: -x[0])
+            # 页级锚点一页几千字，字面重合挑出来的句子大概率不支撑结论。
+            # 标出来，别让人以为「有候选就能用」。
+            coarse = a["locator"].startswith("p.") and len(frag) > 1500
+            plan.append({
+                "line": no,
+                "locator": a["locator"],
+                "context": ctx.strip()[:160],
+                "coarse": coarse,
+                "frag_len": len(frag),
+                "candidates": [(round(s, 2), c) for s, c in scored[:3]],
+            })
+
+    applied = 0
+    if args.apply and plan:
+        by_line: dict[int, list[dict]] = {}
+        for p in plan:
+            if p["candidates"] and p["candidates"][0][0] >= args.threshold:
+                by_line.setdefault(p["line"], []).append(p)
+        for no, items in by_line.items():
+            line = lines[no - 1]
+            for a in sorted(d.parse_anchors(line), key=lambda x: -x["span"][0]):
+                if a["quote"] or is_example_anchor(line, a["span"][0], a["quote"]):
+                    continue
+                hit = next((it for it in items if it["locator"] == a["locator"]), None)
+                if hit is None:
+                    continue
+                new = d.render_anchor(a["locator"], hit["candidates"][0][1])
+                line = line[:a["span"][0]] + new + line[a["span"][1]:]
+                applied += 1
+            lines[no - 1] = line
+        d.atomic_write(rep, "\n".join(lines) + "\n")
+
+    if args.json:
+        print(json.dumps({"report": str(rep), "pending": len(plan),
+                          "locate_failed": missed, "applied": applied,
+                          "items": plan}, ensure_ascii=False, indent=2))
+        return d.OK
+
+    if not plan and not missed:
+        print("没有裸锚点，全部已带引文。")
+        return d.OK
+
+    print(f"待补引文：{len(plan)} 处；定位失败：{len(missed)} 处\n")
+    coarse_n = sum(1 for p in plan if p.get("coarse"))
+    if coarse_n:
+        print(f"其中 {coarse_n} 处是页级锚点（一页上千字），候选只能算「大致相关」，"
+              f"建议改成节级锚点再回填。\n")
+    for p in plan:
+        print(f"L{p['line']}  [{p['locator']}]")
+        if p.get("coarse"):
+            print(f"   ⚠ 页级锚点：原文该位置 {p['frag_len']} 字，候选可靠性低")
+        print(f"   结论：{p['context']}")
+        if not p["candidates"]:
+            print("   候选：（该位置无可切割的句子，需手写引文）")
+        for score, cand in p["candidates"]:
+            flag = " ← 首选" if score == p["candidates"][0][0] else ""
+            print(f"   [{score:.2f}] {cand}{flag}")
+        print()
+
+    if missed:
+        print("定位失败（原文里没有这个位置，先修定位符）：")
+        for m in missed:
+            print(f"   L{m['line']} [{m['locator']}] —— {m['error']}")
+
+    if args.apply:
+        print(f"\n已回填 {applied} 处（阈值 {args.threshold}）。请立即跑 verify 复核，"
+              f"并按 references/audit-protocol.md 人工确认语义是否支撑。")
+    else:
+        print("\n未改动文件。确认候选后用 --apply 回填，或逐条手写。")
+    return d.OK
+
+
 # ---------------------------------------------------------------- eval
 
 def cmd_eval(args) -> int:
@@ -662,9 +852,18 @@ def main(argv: list[str]) -> int:
     w.add_argument("--overwrite", action="store_true", help="覆盖同名报告（仅当用户明确要求更新那篇）")
     w.add_argument("--json", action="store_true")
 
-    e = sub.add_parser("eval", help="跑标注测试集")
-    e.add_argument("cases")
+    e = sub.add_parser("upgrade", help="给只有定位符的旧锚点找候选引文")
+    e.add_argument("report")
+    e.add_argument("--src", required=True)
+    e.add_argument("--segments", default=None)
+    e.add_argument("--apply", action="store_true", help="把首选候选直接写回报告")
+    e.add_argument("--threshold", type=float, default=0.3,
+                   help="自动回填的最低字面重合度（默认 0.3）")
     e.add_argument("--json", action="store_true")
+
+    e2 = sub.add_parser("eval", help="跑标注测试集")
+    e2.add_argument("cases")
+    e2.add_argument("--json", action="store_true")
 
     args = p.parse_args(argv)
     if args.cmd == "verify":
@@ -674,6 +873,8 @@ def main(argv: list[str]) -> int:
         return exit_code_for(res)
     if args.cmd == "write":
         return cmd_write(args)
+    if args.cmd == "upgrade":
+        return cmd_upgrade(args)
     if args.cmd == "eval":
         return cmd_eval(args)
     p.print_help()
