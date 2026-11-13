@@ -1,7 +1,7 @@
 ---
 name: distill-to-vault
 description: '把一个链接或一份文件蒸馏成带定位引用的结构化报告，按学科归档进本地 Obsidian 知识库（直接写 md 文件，不依赖 obsidian-cli）。每个锚点必须带原文逐字引文，并由 audit.py 自动校验定位存在性、引文逐字命中、正文与定位表双向一致；校验不通过不许写盘。用于：蒸馏 / 总结并入库 / 存到 Obsidian / 这篇公众号帮我整理 / 小红书笔记提炼 / 这个视频讲了什么并归档 / 论文或研报精读笔记 / distill this into my vault。不用于：把书或长视频拆成可执行 skill（用 cangjie-skill）；只要爆款标题、文案改写、起号选题（本 skill 不做营销文案）；只想要 PDF 纯文本提取（用 workbuddy-pdf）；只想要原子化卡片笔记。'
-version: 3.0.0
+version: 3.1.0
 display_name: '内容蒸馏入库'
 display_name_en: 'Distill to Vault'
 description_zh: '公众号/小红书/知乎/网页、抖音/视频号/B站短视频、论文与券商研报 → 带定位引用的蒸馏报告 → 按学科写入 Obsidian 知识库，并挂进总纲。'
@@ -34,6 +34,18 @@ agent_created: true
 - 只要**标题、文案、选题、钩子**，不关心内容结构 → 文案类 skill。
 - 只要**把 PDF 转成文本/表格**，不做提炼 → `workbuddy-pdf`。
 - 内容超过 40 分钟且用户要「方法论 / 做成 skill」→ `cangjie-skill`，本 skill 只出报告。
+
+## 首次使用（换机器 / 别人装完第一次跑）
+
+先跑 `python scripts\fetch_text.py doctor`。它把问题分成三类，别混着处理：
+
+| 它说什么 | 含义 | 怎么办 |
+|---|---|---|
+| `vault 不存在` | 路径没配，不是依赖问题 | 设 `DISTILL_VAULT` 指向 Obsidian 库目录，或 write 时带 `--vault` |
+| `核心依赖缺失` | 连网页都抓不了 | 按它打印的命令装，**不要自己编方案，也不要跳过校验直接手写文件** |
+| `A/C 分支可用` | 图文与论文能跑，视频不能 | 先问用户这次是不是真处理视频；不是就别装 faster-whisper |
+
+缺 B 分支只影响视频，不影响公众号和论文。**不要为了「跑通全部」装一堆东西。**
 
 ## 三分支路由
 
@@ -68,13 +80,37 @@ agent_created: true
 ## 统一流程（8 步）
 
 1. **建工作区**。`C:\Temp\distill\<yyyymmdd>-<sha1(url)[:8]>\`。`fetch_text.py` 会写 `meta.json`（schema 2，含 raw 快照与 sha256）。
-2. **取原文**。A/B 调 `scripts\fetch_text.py`；C 调 `workbuddy-pdf`。原文一律落盘，**不整篇读进上下文**，按需读片段。
+2. **取原文，但只取该看的**。A/B 调 `scripts\fetch_text.py`；C 调 `workbuddy-pdf`。原文落盘后**不要 `Read` 整篇**，按三段走：
+
+   | 步 | 命令 | 得到 | 实测成本 |
+   |---|---|---|---|
+   | 看骨架 | `python scripts\view.py outline <content.md>` | 每段/每节/每分钟一行 | 论文 264 token（全文 7,139） |
+   | 定位 | `python scripts\view.py find <src> 关键词…` | 命中段号 + 片段 | 约 100 token |
+   | 取文 | `python scripts\view.py show <src> --para 012,019` / `--section 3.2` / `--time 12:34` | 指定位置全文 | 受 `--budget` 限制，默认 3000 字 |
+
+   **硬规则：`content.md` 超过 3000 字时禁止 `Read` 全文。** 骨架结尾会自报「省多少 / 值不值」——若它说「直接通读更划算」（骨架占比 >35%），那就按它说的通读，别为了流程而流程。
 3. **建锚点台账**。锚点 = **定位符 + 逐字引文**：`[¶012 "原文里逐字出现的一句"]`、`[12:34 "…"]`、`[p.7 §3.2 "…"]`。叙事版写进文末折叠定位表；结论表版直接写在行内。只有定位符、没有引文的锚点**不可审计**。
 4. **按分支蒸馏**。维度表在 `references\`，只读对应那一个。**维度是查漏清单，不是章节目录**——叙事版按原文自身结构写，不把十个维度当十个小标题。
 5. **给每条结论定支持度**（四档，见 `references\audit-protocol.md`）：`{S}` 引文命中 → 正文；`{M}` 原文提到但未证明 → 局限节；`{I}` 我的推断 → 判断节；`{X}` 校验失败 → 删掉。**不再是「找不到就删」，而是「先分清它是哪一档」**。
 6. **跑校验**。`python scripts\audit.py verify <草稿> --src <原文>`。**退出码 20 = 不通过，禁止交付**，按报错逐条修，不许绕过、不许删检查项。
 7. **写盘**。`python scripts\audit.py write <草稿> --vault <vault> --topic <学科> --summary "<一句话结论>" --src <原文>`。校验不过会被拒绝写入；内部用临时文件 + `os.replace` 原子写，条目按学科落目录、总纲按文件名幂等更新。
 8. **回报**。一句话结论 / 落盘路径 / 校验统计（锚点数、带引文数、ERROR 与 WARN 数）/ 降级项。
+
+## token 预算
+
+省 token 不靠在提示词里说「简短」，靠**不让原文进上下文**。一篇 1.8 万字公众号通读约 1.3 万 token，按骨架走再取 6 段，约 2,300 token。
+
+| 源 | 规模 | 通读 | 骨架 | 实际要读 |
+|---|---|---|---|---|
+| 公众号长文 | 2 万字 / 120 段 | 约 14,000 | 约 600 | 6–10 段 ≈ 2,000 |
+| 论文 | 4 万字 / 22 节 | 约 7,100 | 约 260 | 5–8 节 ≈ 1,500 |
+| 口播视频 20 分钟 | 5,500 字 / 400 段 | 约 4,000 | 约 400 | 8–12 个时间窗 ≈ 1,800 |
+
+三条配套规则：
+
+- **校验输出按类型分组**，每类给 2 个样例。要看全部加 `--full`——只在「同类错误连报几十条、必须逐条修」时才用。
+- **视频按时间窗聚合**（`--window`，默认 60 秒）。转写段是 7 字碎片，逐段列等于抄全文。
+- **不回读自己的草稿**。写完直接跑 verify，按报错定位行号改，不要 Read 整篇草稿再想哪里要改。
 
 ## 知识库写入规则
 
@@ -102,11 +138,17 @@ python scripts\fetch_text.py fetch <url> [--out-dir DIR] [--timeout 20] [--json]
 python scripts\fetch_text.py video <url> [--out-dir DIR] [--model tiny|small] [--lang zh] [--json]
 python scripts\fetch_text.py transcribe <local-media> [--out-dir DIR] [--model tiny|small] [--json]
 
-python scripts\audit.py verify <report.md> --src <content.md> [--segments seg.jsonl] [--json]
+python scripts\view.py outline <src> [--head 24] [--window 60] [--json]
+python scripts\view.py find    <src> 关键词… [--ctx 60] [--top 10]
+python scripts\view.py show    <src> [--para 012,019] [--section 3.2] [--page 7] [--time 12:34] [--budget 3000]
+
+python scripts\audit.py verify <report.md> --src <content.md> [--segments seg.jsonl] [--full] [--json]
 python scripts\audit.py write  <draft.md>  --vault <dir> [--topic 学科] [--summary "一句话"] [--src ...] [--overwrite] [--force] [--json]
 python scripts\audit.py upgrade <old.md>   --src <content.md> [--apply] [--threshold 0.3] [--json]
 python scripts\audit.py eval   <cases_dir> [--json]
 ```
+
+`view.py` 是省 token 的那一半：`outline` 给结构（每项一行），`find` 按词定位，`show` 按位置取全文。它只读不写，取不到内容时按错误码退出，不会返回半截假数据。
 
 `upgrade` 只解决旧笔记「有定位符、没引文」的体力活：按定位取原文、切句、按字面重合度排候选。**语义是否支撑结论仍需人判断**，`--apply` 后必须跑 verify 并在交付时说明哪些引文是机器挑的。
 

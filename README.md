@@ -39,16 +39,23 @@ python scripts/fetch_text.py doctor
 把这个链接蒸馏一下：https://mp.weixin.qq.com/s/xxxx
 ```
 
-或者手动跑三步：
+或者手动跑五步：
 
 ```bash
-# 1. 取原文，落盘到工作区（不整篇读进上下文）
+# 1. 取原文，落盘到工作区
 python scripts/fetch_text.py fetch <url> --out-dir C:\Temp\distill\job1
 
-# 2. 校验（退出码 20 = 不通过，不许交付）
+# 2. 看骨架：每段一行，不到 300 token 看完一篇论文的结构
+python scripts/view.py outline C:\Temp\distill\job1\content.md
+
+# 3. 只取要写的那几段（不要通读全文）
+python scripts/view.py show C:\Temp\distill\job1\content.md --para 019,020
+python scripts/view.py find C:\Temp\distill\job1\content.md 凯利 仓位
+
+# 4. 校验（退出码 20 = 不通过，不许交付）
 python scripts/audit.py verify 草稿.md --src C:\Temp\distill\job1\content.md
 
-# 3. 按学科写进知识库，总纲自动更新
+# 5. 按学科写进知识库，总纲自动更新
 python scripts/audit.py write 草稿.md --vault E:/football/足球 \
   --topic 人工智能 --summary "一句话结论" --src C:\Temp\distill\job1\content.md
 ```
@@ -58,6 +65,22 @@ python scripts/audit.py write 草稿.md --vault E:/football/足球 \
 ```bash
 python scripts/fetch_text.py video <抖音/B站链接> --out-dir C:\Temp\distill\job2 --model small
 ```
+
+## 省 token 的地方
+
+写报告最烧 token 的一步不是「输出」，是「把原文整篇读进来」。一篇 1.8 万字公众号约 1.3 万 token，而你真正会引用到的往往只有 6–10 段。
+
+所以 `view.py` 提供三个视图，让上下文只装该装的部分：
+
+| 命令 | 输出 | 实测 |
+|---|---|---|
+| `outline` | 每段/每节/每分钟一行 | 论文 4 万字 → **260 token**（全文 7,139） |
+| `find` | 命中段号 + 短片段 | 约 100 token |
+| `show` | 指定位置全文，受 `--budget` 限制 | 默认 3000 字 |
+
+两个细节做得比较笨但必要：骨架结尾会自己算「骨架占全文多少」，超 35% 就直接告诉你「别看了，通读更划算」——短文章硬套流程是浪费；视频按时间窗聚合（默认 60 秒），因为转写段是 7 字碎片，逐段列等于把全文抄一遍。
+
+校验输出也按类型分组，每类只给 2 个样例。旧格式报告能一次报出 60 多条同类错误，逐条打印除了烧 token 没别的用；要逐条看加 `--full`。
 
 ## 校验器在查什么
 
@@ -115,6 +138,7 @@ python scripts/audit.py upgrade 旧笔记.md --src content.md --apply  # 回填�
 ```
 SKILL.md                  入口：分支路由、写入规则、脚本契约
 scripts/fetch_text.py     取源：SSRF 校验、限长、快照、转写
+scripts/view.py           视图：骨架 / 按词定位 / 按段取文（省 token）
 scripts/audit.py          校验 + 写盘 + 升级 + 用例评估
 scripts/dvlib.py          公共库：规范化、锚点解析、原子写
 references/               三个分支的维度表 + 审计协议

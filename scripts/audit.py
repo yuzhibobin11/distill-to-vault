@@ -514,17 +514,33 @@ def exit_code_for(res: dict) -> int:
     return {"error": d.V_ERROR, "warn": d.V_WARN}.get(res["status"], d.V_OK)
 
 
-def print_verify(res: dict, as_json: bool) -> None:
+def print_verify(res: dict, as_json: bool, full: bool = False) -> None:
+    """默认按「检查类型」分组，每类只给 2 个样例。
+
+    一篇旧格式报告能报出几十条同类错误，逐条打印除了烧 token 没有别的用处 ——
+    需要的是「哪几类问题、各几条」，不是「第 3 条到第 66 条分别长什么样」。
+    """
     if as_json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return
+
+    groups: dict[tuple[str, str], list[dict]] = {}
     for it in res["items"]:
-        tag = "ERROR" if it["level"] == "ERROR" else "WARN "
-        where = f" @{it['locator']}" if it["locator"] else ""
-        ln = f" L{it['line']}" if it["line"] else ""
-        print(f"[{tag}] {it['code']:<13}{where}{ln}  {it['detail']}")
+        groups.setdefault((it["level"], it["code"]), []).append(it)
+
+    cap = 999 if full else 2
+    for (lvl, code), items in sorted(groups.items(), key=lambda kv: (kv[0][0] != "ERROR", kv[0][1])):
+        tag = "ERROR" if lvl == "ERROR" else "WARN "
+        print(f"[{tag}] {code} ×{len(items)}")
+        for it in items[:cap]:
+            where = f" @{it['locator']}" if it["locator"] else ""
+            ln = f" L{it['line']}" if it["line"] else ""
+            print(f"        {where}{ln}  {it['detail']}")
+        if len(items) > cap:
+            print(f"        … 同类还有 {len(items) - cap} 条（--full 全看）")
+        print()
+
     s = res["stats"]
-    print()
     print(f"锚点 {s.get('anchors', 0)} 个，其中带引文 {s.get('quoted', 0)} 个"
           f"（S={s.get('S', 0)} M={s.get('M', 0)} I={s.get('I', 0)} X={s.get('X', 0)}）")
     c = res["counts"]
@@ -1071,6 +1087,7 @@ def main(argv: list[str]) -> int:
     v.add_argument("--src", required=True, help="原文 content.md 或 PDF 转出的 md")
     v.add_argument("--segments", default=None)
     v.add_argument("--json", action="store_true")
+    v.add_argument("--full", action="store_true", help="逐条列出全部问题（默认每类只给 2 个样例）")
 
     w = sub.add_parser("write", help="校验后原子写入知识库并更新总纲")
     w.add_argument("draft")
@@ -1106,7 +1123,7 @@ def main(argv: list[str]) -> int:
     if args.cmd == "verify":
         res = verify(Path(args.report), Path(args.src),
                      Path(args.segments) if args.segments else None)
-        print_verify(res, args.json)
+        print_verify(res, args.json, getattr(args, "full", False))
         return exit_code_for(res)
     if args.cmd == "write":
         return cmd_write(args)

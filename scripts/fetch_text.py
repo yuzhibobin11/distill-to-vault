@@ -636,7 +636,8 @@ def cmd_doctor(args) -> int:
         fw = getattr(faster_whisper, "__version__", "installed")
     except ImportError:
         fw = None
-    vault = Path(os.environ.get("DISTILL_VAULT") or r"E:/football/足球")
+    vault_env = os.environ.get("DISTILL_VAULT")
+    vault = Path(vault_env or r"E:/football/足球")
     vault_ok = vault.is_dir()
     probe_dir = TEMP_ROOT / ".probe"
     try:
@@ -653,7 +654,7 @@ def cmd_doctor(args) -> int:
         ("workbuddy-pdf", bool(pdf_ver), pdf_ver or "missing"),
         ("faster-whisper", bool(fw), fw or "missing (仅 B 分支需要)"),
         ("temp writable", tmp_ok, str(TEMP_ROOT)),
-        ("vault", vault_ok, str(vault)),
+        ("vault", vault_ok, str(vault) + ("" if vault_env else "（未设 DISTILL_VAULT，用的是本机默认值）")),
     ]
     core_ok = py_ok and bool(req_ver) and tmp_ok and vault_ok
     if args.json:
@@ -663,7 +664,12 @@ def cmd_doctor(args) -> int:
     else:
         for n, v, d in rows:
             print(f"[{'OK ' if v else 'WARN'}] {n:<16} {d}")
-        if not core_ok:
+        if not vault_ok:
+            print(f"\nvault 不存在：{vault}")
+            print('  设环境变量指向你的 Obsidian 库目录：')
+            print(r'    setx DISTILL_VAULT "D:\我的笔记库"')
+            print("  或者每次 write 时用 --vault 指定。这是配置问题，不是依赖没装。")
+        elif not core_ok:
             print("\n核心依赖缺失，A/C 也不可用")
         elif not fw or not ytdlp:
             print("\nA/C 分支可用")
