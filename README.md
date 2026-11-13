@@ -55,8 +55,8 @@ python scripts/view.py find C:\Temp\distill\job1\content.md 凯利 仓位
 # 4. 校验（退出码 20 = 不通过，不许交付）
 python scripts/audit.py verify 草稿.md --src C:\Temp\distill\job1\content.md
 
-# 5. 按学科写进知识库，总纲自动更新
-python scripts/audit.py write 草稿.md --vault E:/football/足球 \
+# 5. 按学科写进知识库，总纲自动更新（--vault 可省：脚本按 DISTILL_VAULT → 常见 Obsidian 库自动定位）
+python scripts/audit.py write 草稿.md \
   --topic 人工智能 --summary "一句话结论" --src C:\Temp\distill\job1\content.md
 ```
 

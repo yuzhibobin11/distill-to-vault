@@ -733,7 +733,16 @@ def cmd_write(args) -> int:
             return d.V_ERROR
 
 
-    vault = Path(args.vault)
+    vault, vault_src = (Path(args.vault).expanduser(), "arg") if args.vault else d.resolve_vault()
+    if vault is None:
+        print(d.vault_hint(), file=sys.stderr)
+        return d.E_VAULT
+    vault = Path(vault)
+    # 显式给错路径不能静默建库：那会把笔记写到用户不知道的地方
+    if not vault.is_dir() and (vault_src in ("arg", "env")):
+        print(f"vault 目录不存在：{vault}", file=sys.stderr)
+        print(f'  先建它 mkdir "{vault}"，或换成正确的库目录', file=sys.stderr)
+        return d.E_VAULT
     branch = fm.get("branch", "text-image")
     platform = fm.get("platform", "web")
     published = str(fm.get("published") or "")[:10]
@@ -1091,7 +1100,7 @@ def main(argv: list[str]) -> int:
 
     w = sub.add_parser("write", help="校验后原子写入知识库并更新总纲")
     w.add_argument("draft")
-    w.add_argument("--vault", required=True)
+    w.add_argument("--vault", help="vault 根目录；不传则读 DISTILL_VAULT，再不行自动探测 Obsidian 库")
     w.add_argument("--topic", default=None,
                    help="学科目录：人工智能/心理学/方法论/商业/健康/人文，也可自定；缺省取 frontmatter 的 topic")
     w.add_argument("--summary", default=None,

@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import socket
 import sys
@@ -115,6 +116,60 @@ def sha256_text(s: str) -> str:
 
 def now_iso() -> str:
     return datetime.now(TZ).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- vault 定位
+
+def _vault_candidates() -> list[Path]:
+    """常见 Obsidian 库位置。顺序即优先级，只认「像库」的目录。"""
+    home = Path.home()
+    docs = home / "Documents"
+    out: list[Path] = []
+    for base in (docs, home):
+        out += [
+            base / "Obsidian" / "知识库",
+            base / "Obsidian" / "Obsidian Vault",
+            base / "Obsidian" / "Notes",
+            base / "Obsidian",
+            base / "我的知识库",
+            base / "knowledge-base",
+        ]
+    # 老版本硬编码过的默认值，留着防止升级后原地失联
+    out.append(Path("E:/football/足球"))
+    return out
+
+
+def _looks_like_vault(p: Path) -> bool:
+    if not p.is_dir():
+        return False
+    return (p / ".obsidian").is_dir() or (p / "知识库").is_dir()
+
+
+def resolve_vault() -> tuple[Path | None, str]:
+    """返回 (vault 目录, 来源)。
+
+    来源：`env`（DISTILL_VAULT）/ `probe`（自动探测到）/ `unset`（没找到，返回 None）。
+    没找到时调用方负责打印配置指引，不要静默用某个不存在的路径。
+    """
+    env = os.environ.get("DISTILL_VAULT")
+    if env:
+        return Path(env).expanduser(), "env"
+    for c in _vault_candidates():
+        if _looks_like_vault(c):
+            return c, "probe"
+    return None, "unset"
+
+
+def vault_hint(default_path: str = r"D:\我的笔记库") -> str:
+    """vault 未配置时给用户看的可复制命令（三选一）。"""
+    return "\n".join([
+        "vault 没配置。三选一，不要跳过：",
+        "  1) 已有 Obsidian 库：设环境变量（设完要重开终端）",
+        f'       setx DISTILL_VAULT "{default_path}"',
+        "  2) 就这一次：write 时带 --vault <你的库目录>",
+        "  3) 还没有库：建一个空目录当知识库也行",
+        f'       mkdir "{default_path}" && setx DISTILL_VAULT "{default_path}"',
+    ])
 
 
 # ---------------------------------------------------------------- URL 安全

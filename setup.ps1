@@ -37,7 +37,8 @@ python scripts/fetch_text.py doctor
 Write-Host @"
 
 下一步：
-  1. 设 vault 路径（不设则默认 E:/football/足球）
+  1. vault 路径：已经有 Obsidian 库的话，上面 doctor 会自动认出来，不用设。
+     没认出来才需要设（doctor 会打印可直接复制的命令）：
        setx DISTILL_VAULT "你的Obsidian库路径"
   2. 取一篇试试
        python scripts/fetch_text.py fetch <url> --out-dir C:\Temp\distill\job1
