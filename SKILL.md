@@ -1,7 +1,7 @@
 ---
 name: distill-to-vault
 description: '把一个链接或一份文件蒸馏成带定位引用的结构化报告，按学科归档进本地 Obsidian 知识库（直接写 md 文件，不依赖 obsidian-cli）。每个锚点必须带原文逐字引文，并由 audit.py 自动校验定位存在性、引文逐字命中、正文与定位表双向一致；校验不通过不许写盘。用于：蒸馏 / 总结并入库 / 存到 Obsidian / 这篇公众号帮我整理 / 小红书笔记提炼 / 这个视频讲了什么并归档 / 论文或研报精读笔记 / distill this into my vault。不用于：把书或长视频拆成可执行 skill（用 cangjie-skill）；只要爆款标题、文案改写、起号选题（本 skill 不做营销文案）；只想要 PDF 纯文本提取（用 workbuddy-pdf）；只想要原子化卡片笔记。'
-version: 2.2.0
+version: 3.0.0
 display_name: '内容蒸馏入库'
 display_name_en: 'Distill to Vault'
 description_zh: '公众号/小红书/知乎/网页、抖音/视频号/B站短视频、论文与券商研报 → 带定位引用的蒸馏报告 → 按学科写入 Obsidian 知识库，并挂进总纲。'
@@ -60,7 +60,7 @@ agent_created: true
 | 模板 | `templates\report-note.md` | `templates\report-base.md` + 分支 delta |
 | 形态 | 按原文自身顺序写成散文，能通读 | 结论压成表，每句挂锚点 |
 | 锚点 | 正文用轻量时间戳/页码括注（`（01:14）`），逐句原文折叠在文末定位表 | 行内 `[12:34 "逐字引文"]` |
-| 校验 | 跳过 BIDIR / LEVEL / THIN，只查 schema 与已出现锚点的引文 | 九类全查 |
+| 校验 | 跳过 BIDIR / LEVEL / THIN，只查 schema 与已出现锚点的引文 | 十类全查 |
 | 用于 | 沉淀成知识库、日后自己重读 | 要引用、要逐句回查、要核查争议 |
 
 默认出叙事版。只有当用户明说「要引用清单 / 要逐句核对 / 要表格」，才出结论表版。同一素材两版都出时，以叙事版为主文件，结论表版作为附属。
@@ -129,7 +129,9 @@ python scripts\audit.py eval   <cases_dir> [--json]
 | 11 | URL 不安全（私网/内网/非 http/https） | **停，不换写法绕过**，告诉用户该地址不可抓 |
 | 12 | 超过大小上限 | 停，让用户本地下载后走 `transcribe` 或 PDF 路径 |
 
-`audit.py` 退出码：`0` 全过 / `20` 有 ERROR（**禁止交付**）/ `21` 只有 WARN。校验项共九类：`LOC-EXISTS` `QUOTE-MISSING` `QUOTE-HIT` `BIDIR` `LEVEL` `COARSE` `THIN` `SCHEMA` `CLAIM`，定义见 `references\audit-protocol.md`。
+`audit.py` 退出码：`0` 全过 / `20` 有 ERROR（**禁止交付**）/ `21` 只有 WARN / `2` 用法或前置条件不满足。校验项共十类：`LOC-EXISTS` `QUOTE-MISSING` `QUOTE-HIT` `MALFORMED` `BIDIR` `LEVEL` `COARSE` `THIN` `SCHEMA` `CLAIM`，定义见 `references\audit-protocol.md`。
+
+其中 `MALFORMED` 是专门防假象的一条：报告里写成 `[p.9 Table 3 行 A]`、`[p.10 References]` 这种「看着像锚点、其实不在语法里」的标注，其它检查全看不见，只有它会把它们挖出来报 ERROR。**写锚点前先确认形态合法**，别等交付才发现一堆标注根本没被检查。
 
 **写 vault 的唯一入口是 `audit.py write`**，它内部先跑 verify，不通过就拒绝写入。`fetch_text.py` 只写临时区。
 

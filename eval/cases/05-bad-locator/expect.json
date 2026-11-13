@@ -1,0 +1,5 @@
+{
+  "status": "error",
+  "require": ["MALFORMED", "LOC-EXISTS"],
+  "forbid": ["SCHEMA"]
+}

@@ -83,16 +83,22 @@ LIMITS = {
 
 _ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\ufeff\u2060"), None)
 _WS = re.compile(r"\s+")
+# PDF 文本层会夹带 \x01 \x02 这类控制字符（连字符与软换行的残渣）。
+# 它们不是原文的一部分，保留就永远对不上。
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def normalize(s: str) -> str:
-    """比对用的规范化：全半角统一、去零宽、空白压成一个、去首尾空白。
+    """比对用的规范化：全半角统一、去零宽与控制字符、空白压成一个、去首尾空白。
 
     不做大小写折叠 —— 逐字核对必须大小写敏感。
     """
     if not s:
         return ""
     s = s.translate(_ZERO_WIDTH)
+    # PDF 抽取常在断行处留下 \x02 之类的控制字符（不是字，是残渣），
+    # 不清掉的话人写引文永远命中不了。
+    s = _CTRL.sub("", s)
     s = unicodedata.normalize("NFKC", s)   # 全角→半角，兼容字符归一
     s = s.replace("\u00a0", " ").replace("\u3000", " ")
     s = _WS.sub(" ", s)
@@ -259,9 +265,22 @@ def safe_get(url: str, *, timeout: int = 20, max_bytes: int | None = None,
 #
 # 引文可以含 … 或 ... 表示省略，校验时按段顺序查找。
 
-LOCATOR = r"""(?:¶\d{3,4}|\d{1,3}:\d{2}(?::\d{2})?|p\.\d{1,4}(?:\s*§[\d.]+)?(?:\s*Table\s*\d+(?:\s*r\d+c\d+)?)?(?:\s*eq\.\d+)?)"""
+_SEC = r"§\s*(?:\d+(?:\.\d+)*|[A-Za-z][A-Za-z0-9.\-]*(?:\s+[A-Z][A-Za-z0-9.\-]*){0,3}|附录\s*[A-Z]?)"
+_PAGE = r"p\.\d{1,4}(?!\d)(?:-\d{1,4})?"
+LOCATOR = (r"(?:¶\d{3,4}"
+           r"|\d{1,3}:\d{2}(?::\d{2})?"
+           r"|" + _PAGE +
+           r"(?:\s*" + _SEC + r")?"
+           r"(?:\s*Table\s*\d+(?:\s*[rR][A-Za-z0-9]+(?:[cC]\d+)?)?)?"
+           r"(?:\s*eq\.\d+)?"
+           r"(?:\s*(?:n|fn|脚注)\s*\d+)?"
+           r")")
 ANCHOR_RE = re.compile(r"\[(" + LOCATOR + r")(?:\s+\"([^\"]{0,400})\")?\]")
 CITE_RE = re.compile(r"\[\^(\d{1,3})\]")   # 可选的脚注式引用，供密集报告用
+
+# 疑似锚点：方括号里以 p. / ¶ / 时间戳 / § 开头。用来抓格式漂移——
+# 写成 [p.8 脚注 5] 这种，校验器若认不出，就等于没校验，而报告看上去「有锚点」。
+SUSPECT_RE = re.compile(r"\[((?:p\.|¶|§|\d{1,3}:\d{2})[^\]\n]{0,60})\]")
 
 QUOTE_MIN, QUOTE_MAX = 8, 160
 
@@ -352,6 +371,108 @@ def load_pages(md: Path) -> dict[int, str]:
     for i, (off, num) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
         out[num] = text[off:end]
+    return out
+
+
+# PDF 抽取器把章节标题抽成 markdown 标题（`# 3.2 Attention`），但漏抽的也常见，
+# 它们退化成独立成行的一行（`3.2.1 Scaled Dot-Product Attention`）。两种都认。
+# 正文里被误判成标题的行（`# of the values, …`）不以编号开头，自然排除。
+SECTION_RE = re.compile(r"^(#{1,6})[ \t]+(\d+(?:\.\d+)*)[ \t]+(\S.{1,58})$", re.M)
+SECTION_BARE = re.compile(r"^(\d+(?:\.\d+)+)[ \t]+([A-Z][^.!?。！？]{2,58})$", re.M)
+HEADING_ANY = re.compile(r"^(#{1,6})[ \t]+", re.M)
+
+
+class Sections(dict):
+    """§号 → 节。`by_name` 按标题名索引，供 §Abstract / §References 这类无编号节使用。"""
+
+    def __init__(self):
+        super().__init__()
+        self.by_name: dict[str, dict] = {}
+
+
+def _heading_text(text: str, m: re.Match) -> str:
+    end = text.find("\n", m.end())
+    return text[m.end(): end if end > 0 else len(text)].strip()
+
+
+def _is_heading(text: str, m: re.Match) -> bool:
+    """标题不会是一整段话：短、不以句末标点结尾。"""
+    t = _heading_text(text, m)
+    if not t or len(t) > 60:
+        return False
+    return not t.endswith(("。", ".", "!", "?", "；", ";", ","))
+
+
+def name_key(title: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", title.lower())
+
+
+def load_sections(md: Path) -> Sections:
+    """按标题切节，返回 Sections：§号 → {title, text, page, end_page}。
+
+    节文本从该标题之后到「下一个任意标题」之前，所以 §3.2 的文本含它的子节。
+    页码用于核对「§3.2 到底在第几页」，防止页码与节号互相矛盾。
+    """
+    text = md.read_text(encoding="utf-8")
+    marks = [(m.start(), int(m.group(1)))
+             for m in re.finditer(r"<!--\s*page\s+(\d+)\s*-->", text)]
+
+    def page_at(off: int) -> int:
+        cur = 0
+        for start, num in marks:
+            if start <= off:
+                cur = num
+            else:
+                break
+        return cur
+
+    numbered = {m.start(): (m.end(), m.group(2), m.group(3).strip())
+                for m in SECTION_RE.finditer(text)}
+    numbered.update({m.start(): (m.end(), m.group(1), m.group(2).strip())
+                     for m in SECTION_BARE.finditer(text)})
+
+    # 无编号标题（Abstract / References / 附录）也要能按名字定位
+    for m in HEADING_ANY.finditer(text):
+        if m.start() in numbered:
+            continue
+        line_end = text.find("\n", m.end())
+        title = text[m.end(): line_end if line_end > 0 else len(text)].strip()
+        if 0 < len(title) <= 60:
+            numbered[m.start()] = (line_end if line_end > 0 else m.end(), None, title)
+
+    heads = sorted(numbered.items())
+    if not heads:
+        return Sections()
+
+    # 所有标题（含无编号的 References、Abstract）都是节的边界。
+    # 但 PDF 抽取会把长段落也标成 heading（`# We also experimented with…`），
+    # 那种不能当边界，否则整段内容就掉到节外面去了。
+    bounds = {m.start() for m in HEADING_ANY.finditer(text) if _is_heading(text, m)}
+    bounds |= {h[0] for h in heads}
+    bounds = sorted(bounds)
+
+    out = Sections()
+    for off, (body_off, num, title) in heads:
+        nxt = next((b for b in bounds if b > off), len(text))
+        raw_body = text[body_off:nxt]
+        # 尾部只剩页标记/空白时，本节的结束页要按最后一段真正文算，
+        # 否则节会「跨到下一页」，页与节互相矛盾就查不出来。
+        tail = re.search(r"(?:\s*<!--.*?-->)*\s*$", raw_body, re.S)
+        content_end = body_off + (tail.start() if tail else len(raw_body))
+        # 页标记/图注注释夹在句子里会让跨页引文无法逐字命中，先清成空格
+        seg = re.sub(r"<!--.*?-->", " ", raw_body, flags=re.S).strip()
+        start_pg = page_at(off)
+        end_pg = page_at(max(off, content_end - 1)) if content_end > body_off else start_pg
+        rec = {"title": title, "text": seg, "page": start_pg,
+               "end_page": max(start_pg, end_pg)}
+        out.by_name.setdefault(name_key(title), rec)
+        if num is None:
+            continue
+        # 同一编号出现多次（PDF 页眉重复标题）时保留最长的那段
+        if num in out and len(out[num]["text"]) >= len(seg):
+            continue
+        out[num] = rec
+        out.by_name.setdefault(name_key(num + " " + title), rec)
     return out
 
 

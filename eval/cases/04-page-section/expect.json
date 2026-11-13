@@ -1,0 +1,4 @@
+{
+  "status": "ok",
+  "forbid": ["QUOTE-HIT", "QUOTE-MISSING", "LOC-EXISTS", "MALFORMED", "BIDIR", "LEVEL", "SCHEMA", "COARSE"]
+}

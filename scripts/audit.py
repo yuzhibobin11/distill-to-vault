@@ -40,6 +40,7 @@ class Source:
     def __init__(self, src: Path, segments: Path | None = None):
         self.paras: dict[str, str] = {}
         self.pages: dict[int, str] = {}
+        self.sections: dict[str, dict] = {}
         self.segs: list[dict] = []
         self.kind = "unknown"
 
@@ -63,6 +64,11 @@ class Source:
             self.pages = pg
             if self.kind == "unknown":
                 self.kind = "page"
+        sec = d.load_sections(src)
+        if sec:
+            self.sections = sec
+            if self.kind == "unknown":
+                self.kind = "page"
 
         seg_path = segments or (src.parent / "segments.jsonl")
         if seg_path.exists():
@@ -78,6 +84,34 @@ class Source:
             if self.kind == "unknown":
                 self.kind = "segment"
 
+    # -- 节号 → 节
+    def _section(self, no: str) -> tuple[dict | None, str]:
+        """§3.2 → 该节；只有 3.2.1/3.2.2 时合并子节；§Abstract 按标题名找。"""
+        no = no.strip(".").replace(". ", ".")
+        if not self.sections:
+            return None, f"§{no}：原文没有可识别的章节标题（PDF 抽取未给出编号标题）"
+        if no in self.sections:
+            return self.sections[no], ""
+
+        kids = sorted(k for k in self.sections if k.startswith(no + "."))
+        if kids:
+            merged = "\n\n".join(self.sections[k]["text"] for k in kids)
+            first, last = self.sections[kids[0]], self.sections[kids[-1]]
+            return ({"title": f"§{no}（由 {len(kids)} 个子节合并）", "text": merged,
+                     "page": first["page"], "end_page": last["end_page"]}, "")
+
+        # 无编号节：§Abstract / §References / §Conclusion
+        by_name = getattr(self.sections, "by_name", {})
+        key = d.name_key(no)
+        if key and key in by_name:
+            return by_name[key], ""
+        hits = [v for k, v in by_name.items() if key and k.startswith(key)]
+        if len(hits) == 1:
+            return hits[0], ""
+
+        have = "、".join("§" + k for k in sorted(self.sections)[:12])
+        return None, f"原文没有 §{no} 这一节（现有：{have}{' …' if len(self.sections) > 12 else ''}）"
+
     # -- 定位符 → 原文片段
     def fragment(self, locator: str) -> tuple[str | None, str]:
         loc = locator.strip()
@@ -87,11 +121,32 @@ class Source:
                 return self.paras[key], ""
             return None, f"段落 ¶{key} 不存在（原文共 {len(self.paras)} 段）"
         if loc.startswith("p."):
-            m = re.match(r"p\.(\d+)", loc)
+            m = re.match(r"p\.(\d+)(?:-(\d+))?", loc)
             num = int(m.group(1))
-            if num in self.pages:
+            last = int(m.group(2) or num)
+            if num not in self.pages:
+                return None, f"第 {num} 页不存在（原文共 {len(self.pages)} 页）"
+            # 去掉尾部 Table/eq/脚注，剩下的就是节标识
+            rest = loc[m.end():].strip()
+            rest = re.sub(r"\s*(?:Table\s*\d+.*|eq\.\d+|(?:n|fn|脚注)\s*\d+)\s*$", "", rest).strip()
+            if not rest.startswith("§"):
+                if last != num:
+                    span = "".join(self.pages.get(i, "") for i in range(num, last + 1))
+                    if not span:
+                        return None, f"第 {num}-{last} 页不存在"
+                    return span, ""
                 return self.pages[num], ""
-            return None, f"第 {num} 页不存在（原文共 {len(self.pages)} 页）"
+            # 带 §：优先按节取，页只作交叉核对。节比页细一个数量级，
+            # 一页三千字挑不出支撑句，一节两百字才行。
+            sec_no = rest[1:].strip()
+            sec, err = self._section(sec_no)
+            if sec is None:
+                return None, err
+            if not (sec["page"] <= last and num <= sec["end_page"]):
+                return None, (f"§{sec_no} 在第 {sec['page']}"
+                              f"{'–' + str(sec['end_page']) if sec['end_page'] != sec['page'] else ''} 页，"
+                              f"不在第 {num}{'-' + str(last) if last != num else ''} 页")
+            return sec["text"], ""
         m = re.match(r"(\d{1,3}:\d{2}(?::\d{2})?)", loc)
         if m:
             t = d.parse_ts(m.group(1))
@@ -145,12 +200,19 @@ def is_example_anchor(line: str, pos: int, quote: str) -> bool:
 
 
 def drop_example_anchors(body: str) -> str:
+    """去掉引用块里被反引号包住的锚点——那是格式说明，不是引用。
+
+    合法锚点由 ANCHOR_RE 处理；`[p.N §M.K]` 这类占位符不在语法里，
+    但同样只是说明文字，也一并去掉，否则 MALFORMED 会误报。
+    """
     lines = []
     for ln in body.splitlines():
         if ln.lstrip().startswith(">"):
-            for m in reversed(list(d.ANCHOR_RE.finditer(ln))):
-                if is_example_anchor(ln, m.start(), m.group(2) or ""):
-                    ln = ln[:m.start()] + ln[m.end():]
+            for rx in (d.ANCHOR_RE, d.SUSPECT_RE):
+                for m in reversed(list(rx.finditer(ln))):
+                    quote = m.group(2) if (rx is d.ANCHOR_RE and m.lastindex and m.lastindex >= 2) else ""
+                    if is_example_anchor(ln, m.start(), quote or ""):
+                        ln = ln[:m.start()] + ln[m.end():]
         lines.append(ln)
     return "\n".join(lines)
 
@@ -160,18 +222,67 @@ LOC_ROW = re.compile(
     r"^\|\s*\[?(" + d.LOCATOR + r")\]?\s*\|", re.M)
 
 
+def _noise_spans(text: str) -> list[tuple[int, int]]:
+    """不该被当作引用的区间：代码块、表格分隔行。
+
+    注意只记录区间、不删除文本 —— 删字符会让锚点偏移量对不上，
+    报出来的行号就会和文件实际行号错位。
+    """
+    spans = [(m.start(), m.end()) for m in re.finditer(r"```.*?```", text, re.S)]
+    spans += [(m.start(), m.end()) for m in re.finditer(r"^\|[\s:|-]+\|$", text, re.M)]
+    return spans
+
+
+def _anchors_in(text: str) -> list[dict]:
+    noise = _noise_spans(text)
+    out = []
+    for a in d.parse_anchors(text):
+        pos = a["span"][0]
+        if any(s <= pos < e for s, e in noise):
+            continue
+        line_start = text.rfind("\n", 0, pos) + 1
+        line_end = text.find("\n", pos)
+        line = text[line_start: line_end if line_end > 0 else len(text)]
+        if is_example_anchor(line, pos - line_start, a["quote"]):
+            continue
+        out.append(a)
+    return out
+
+
 def anchor_planes(body: str) -> tuple[list[dict], list[dict]]:
-    """把锚点分成两部分：正文锚点、定位表锚点。"""
+    """把锚点分成两部分：正文锚点、定位表锚点。偏移量保留在原文坐标系里。"""
     m = LOC_TABLE_HEAD.search(body)
     if m:
         main, table = body[: m.start()], body[m.start():]
+        table_off = m.start()
     else:
-        main, table = body, ""
-    return (d.parse_anchors(drop_example_anchors(strip_noise(main))),
-            d.parse_anchors(drop_example_anchors(strip_noise(table))))
+        main, table, table_off = body, "", len(body)
+
+    main_a = _anchors_in(main)
+    table_a = [dict(a, span=(a["span"][0] + table_off, a["span"][1] + table_off))
+               for a in _anchors_in(table)]
+    return main_a, table_a
 
 
 # ---------------------------------------------------------------- verify
+
+def _suggest(inner: str) -> str:
+    """对常见的格式漂移给出改法。只给建议，不自动改。"""
+    s = inner.strip()
+    m = re.match(r"p\.(\d+)\s*(?:-\s*(\d+))?\s+Table\s*(\d+)\s*行\s*([A-Za-z0-9]+)", s)
+    if m:
+        return f"表格行请写 [p.{m.group(1)} Table {m.group(3)} r{m.group(4)} \"单元格原文\"]"
+    m = re.match(r"p\.(\d+)\s*(?:-\s*(\d+))?\s+脚注\s*(\d+)", s)
+    if m:
+        return f"脚注请写 [p.{m.group(1)} n{m.group(3)} \"脚注原文\"]"
+    m = re.match(r"p\.(\d+)\s*(?:-\s*(\d+))?\s*(?:§\s*)?(附录\s*[A-Za-z]?|[A-Za-z][\w .\-]{2,30})$", s)
+    if m:
+        page = f"p.{m.group(1)}" + (f"-{m.group(2)}" if m.group(2) else "")
+        return f"节必须带 § 且用原文标题：[{page} §{m.group(3)} \"原文一句\"]"
+    if re.match(r"p\.\d+\s*-\s*\d+\s*$", s):
+        return "页码范围要带节或表格才可核对：[p.13-15 §附录 \"…\"]"
+    return "检查是否漏了 §、写错了页码，或引号没闭合（引文必须用英文双引号）"
+
 
 def verify_text(raw: str, src: Path, segments: Path | None = None) -> dict:
     items: list[dict] = []
@@ -187,6 +298,12 @@ def verify_text(raw: str, src: Path, segments: Path | None = None) -> dict:
     fm, body = d.parse_frontmatter(raw)
     # 两种成稿：distill-report（结论表版，全量校验）/ distill-note（叙事知识库版，跳过表格类检查）
     is_note = fm.get("type") == "distill-note"
+    # 锚点偏移量是相对 body 的；报错行号要加回 frontmatter 占的行数，
+    # 否则行号和用户在编辑器里看到的位置会差一段。
+    fm_lines = raw[: len(raw) - len(body)].count("\n")
+
+    def line_of(span_start: int) -> int:
+        return fm_lines + body[:span_start].count("\n") + 1
 
     # ---------- SCHEMA
     for k in d.FM_REQUIRED:
@@ -240,7 +357,7 @@ def verify_text(raw: str, src: Path, segments: Path | None = None) -> dict:
         stats["anchors"] += 1
         loc, quote = a["locator"], a["quote"]
         seen_locs.add(loc)
-        line = raw[: a["span"][0]].count("\n") + 1
+        line = line_of(a["span"][0])
 
         frag, err = srcobj.fragment(loc)
         if frag is None:
@@ -315,9 +432,42 @@ def verify_text(raw: str, src: Path, segments: Path | None = None) -> dict:
                 f"「{title}」只有 {n_anchor_lines} 条带锚点内容；"
                 f"确实不适用请写 <!-- thin-ok --> 并说明原因，不要灌水")
 
+    # ---------- MALFORMED：看起来是锚点，但校验器认不出来
+    # 这是最危险的一类：报告上「有锚点」，实际完全没被检查。
+    # 扫原文而不是 strip_noise 后的文本，否则报的行号和文件对不上。
+    fence = False
+    for no, ln in enumerate(body.splitlines(), fm_lines + 1):
+        if ln.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        if fence:
+            continue
+        # 合法锚点内部可能含 [9] 这类文献编号，不能让它们被当成疑似锚点
+        ok_spans = [a["span"] for a in d.parse_anchors(ln)]
+        for m in d.SUSPECT_RE.finditer(ln):
+            if any(s <= m.start() < e or s < m.end() <= e for s, e in ok_spans):
+                continue
+            if is_example_anchor(ln, m.start(), ""):
+                continue
+            inner = m.group(1)
+            if d.parse_anchors("[" + inner + "]"):
+                continue
+            add("ERROR", "MALFORMED",
+                f"疑似锚点 [{inner}] 语法不合法，不会被校验。{_suggest(inner)}", inner, no)
+
     # ---------- COARSE 粒度
+    # 允许显式登记豁免行：`<!-- coarse-ok 44,45,81 -->`，用于页眉、作者脚注
+    # 这类「页级已是能拿到的最细粒度」的引用。白名单要写行号，不搞全局豁免。
+    coarse_ok: set[int] = set()
+    for m in re.finditer(r"<!--\s*coarse-ok\s*([\d,\s]+)-->", body):
+        for x in m.group(1).split(","):
+            if x.strip().isdigit():
+                coarse_ok.add(int(x.strip()))
+
     for a in main_anchors:
-        line = raw[: a["span"][0]].count("\n") + 1
+        line = line_of(a["span"][0])
+        if line in coarse_ok:
+            continue
         line_text = raw.splitlines()[line - 1] if line - 1 < total_lines else ""
         claim = d.ANCHOR_RE.sub("", line_text)
         claim = re.sub(r"\|", "", claim).strip()
@@ -328,6 +478,18 @@ def verify_text(raw: str, src: Path, segments: Path | None = None) -> dict:
                 add("WARN", "COARSE",
                     f"结论句 {len(claim)} 字，只挂段落级锚点，而该段 {len(frag)} 字 —— "
                     f"位置对不代表句子被支持，建议换成段内更短的引文", loc, line)
+        elif (loc.startswith("p.") and "§" not in loc and "Table" not in loc
+              and not re.search(r"\bn\d+$", loc) and "-" not in loc):
+            # 脚注（n4）与跨页范围（p.13-15）本身就是最细可用粒度，不再要求细化
+            frag, _ = srcobj.fragment(loc)
+            if frag and len(d.normalize(frag)) > 1500:
+                hint = ""
+                pg = re.match(r"p\.(\d+)", loc)
+                if srcobj.sections and pg:
+                    n = sum(1 for s in srcobj.sections.values() if s["page"] == int(pg.group(1)))
+                    hint = f"，该页含 {n} 个可定位的节" if n else ""
+                add("WARN", "COARSE",
+                    f"页级锚点：该页 {len(frag)} 字{hint}，改成 [p.N §节号] 才能核对到句", loc, line)
 
     # ---------- X 档残留
     if stats.get("X"):
@@ -614,6 +776,9 @@ def _noisy(s: str) -> bool:
 
 def _split_sentences(text: str) -> list[str]:
     """切句，只留长度落在引文区间（8–160）内、且不是抽取残渣的完整句。"""
+    # PDF 抽取会把 <!-- page 3 --> 夹在句中，先清掉，否则会挑出
+    # 「-- page 4 --> Scaled Dot-Product Attention」这种候选写进报告。
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
     t = d.normalize(text)
     out: list[str] = []
 
@@ -654,6 +819,43 @@ def _relevance(ctx: str, cand: str) -> float:
     return len(a & b) / len(b)
 
 
+def pick_section(src: "Source", page: int, ctx: str) -> tuple[str | None, float]:
+    """在一页里挑与结论最相关的节。
+
+    页级锚点一页几千字，挑不出支撑句；节级两百字才行。这一步只用来把锚点
+    的粒度改细，仍然只是字面重合，不保证语义支撑。
+    """
+    if not src.sections:
+        return None, 0.0
+    best, best_score = None, 0.0
+    for no, sec in src.sections.items():
+        if not (sec["page"] <= page <= sec["end_page"]):
+            continue
+        # 节越长越可能是母节，略微惩罚，优先落到最具体的子节
+        score = _relevance(ctx, sec["text"])
+        if len(sec["text"]) > 1200:
+            score *= 0.85
+        if score > best_score:
+            best, best_score = no, score
+    return best, round(best_score, 3)
+
+
+def _cjk_ratio(s: str) -> float:
+    chars = re.sub(r"\s", "", s)
+    if not chars:
+        return 0.0
+    return len(re.findall(r"[\u4e00-\u9fff]", chars)) / len(chars)
+
+
+def _cross_language(ctx_all: str, src_text: str) -> bool:
+    """结论是中文、原文是外语时，字面二元组重合几乎全是巧合。
+
+    这种情况下自动挑的候选不是「相关」，只是「碰巧共享几个字符」，
+    不能写进知识库。工具必须自己认得出这种场景。
+    """
+    return _cjk_ratio(ctx_all) > 0.2 and _cjk_ratio(src_text) < 0.05
+
+
 def cmd_upgrade(args) -> int:
     """把只有定位符的旧锚点，按原文列出候选引文，供人工挑或批量回填。
 
@@ -681,18 +883,32 @@ def cmd_upgrade(args) -> int:
         for a in anchors:
             if a["quote"]:
                 continue
-            frag, err = src.fragment(a["locator"])
+            loc = a["locator"]
+            frag, err = src.fragment(loc)
+            section = None
             if frag is None:
-                missed.append({"line": no, "locator": a["locator"], "error": err})
+                missed.append({"line": no, "locator": loc, "error": err})
                 continue
+
+            # 页级锚点先降到节级：一页三千字挑不出支撑句，一节两百字才行。
+            pm = re.fullmatch(r"p\.(\d+)", loc)
+            if pm and src.sections and "§" not in loc:
+                section, sec_score = pick_section(src, int(pm.group(1)), ctx)
+                if section and sec_score >= args.section_threshold:
+                    finer, ferr = src.fragment(f"p.{pm.group(1)} §{section}")
+                    if finer:
+                        loc, frag = f"p.{pm.group(1)} §{section}", finer
+
             scored = sorted(((_relevance(ctx, c), c) for c in _split_sentences(frag)),
                             key=lambda x: -x[0])
-            # 页级锚点一页几千字，字面重合挑出来的句子大概率不支撑结论。
-            # 标出来，别让人以为「有候选就能用」。
-            coarse = a["locator"].startswith("p.") and len(frag) > 1500
+            # 仍然粗的锚点（裸页级，或整节上千字），标出来，
+            # 别让人以为「有候选就能用」。
+            coarse = loc.startswith("p.") and len(frag) > 1500
             plan.append({
                 "line": no,
                 "locator": a["locator"],
+                "target": loc,
+                "section": section,
                 "context": ctx.strip()[:160],
                 "coarse": coarse,
                 "frag_len": len(frag),
@@ -700,6 +916,17 @@ def cmd_upgrade(args) -> int:
             })
 
     applied = 0
+    cross = False
+    if plan:
+        src_text = src.path.read_text(encoding="utf-8") if src.path.exists() else ""
+        cross = _cross_language(" ".join(p["context"] for p in plan), src_text)
+    if cross and args.apply and not getattr(args, "force", False):
+        print("E_CROSSLANG: 结论是中文、原文是外语，字面重合挑出来的候选只是"
+              "「碰巧共享几个字符」，不是语义支撑。", file=sys.stderr)
+        print("已停止写入。这类报告需要人工逐条挑引文；确认风险后可加 --force 强制执行。",
+              file=sys.stderr)
+        return d.E_USAGE
+
     if args.apply and plan:
         by_line: dict[int, list[dict]] = {}
         for p in plan:
@@ -713,7 +940,8 @@ def cmd_upgrade(args) -> int:
                 hit = next((it for it in items if it["locator"] == a["locator"]), None)
                 if hit is None:
                     continue
-                new = d.render_anchor(a["locator"], hit["candidates"][0][1])
+                # 定位符可能已被降到节级，写回用 target 而不是原始 locator
+                new = d.render_anchor(hit["target"], hit["candidates"][0][1])
                 line = line[:a["span"][0]] + new + line[a["span"][1]:]
                 applied += 1
             lines[no - 1] = line
@@ -730,14 +958,19 @@ def cmd_upgrade(args) -> int:
         return d.OK
 
     print(f"待补引文：{len(plan)} 处；定位失败：{len(missed)} 处\n")
+    refined = [p for p in plan if p.get("section") and p["target"] != p["locator"]]
+    if refined:
+        print(f"其中 {len(refined)} 处可从页级降到节级（一页三千字 → 一节两三百字），"
+              f"候选可靠性随之提高。\n")
     coarse_n = sum(1 for p in plan if p.get("coarse"))
     if coarse_n:
-        print(f"其中 {coarse_n} 处是页级锚点（一页上千字），候选只能算「大致相关」，"
-              f"建议改成节级锚点再回填。\n")
+        print(f"另有 {coarse_n} 处定位仍然过粗（该位置上千字），候选只能算「大致相关」，"
+              f"建议手工改细再回填。\n")
     for p in plan:
-        print(f"L{p['line']}  [{p['locator']}]")
+        move = f" → [{p['target']}]" if p["target"] != p["locator"] else ""
+        print(f"L{p['line']}  [{p['locator']}]{move}")
         if p.get("coarse"):
-            print(f"   ⚠ 页级锚点：原文该位置 {p['frag_len']} 字，候选可靠性低")
+            print(f"   ⚠ 该位置 {p['frag_len']} 字，候选可靠性低")
         print(f"   结论：{p['context']}")
         if not p["candidates"]:
             print("   候选：（该位置无可切割的句子，需手写引文）")
@@ -859,6 +1092,10 @@ def main(argv: list[str]) -> int:
     e.add_argument("--apply", action="store_true", help="把首选候选直接写回报告")
     e.add_argument("--threshold", type=float, default=0.3,
                    help="自动回填的最低字面重合度（默认 0.3）")
+    e.add_argument("--section-threshold", type=float, default=0.2, dest="section_threshold",
+                   help="页级锚点降到节级所需的最低相关度（默认 0.2）")
+    e.add_argument("--force", action="store_true",
+                   help="结论与原文语言不同时仍强行回填（默认拒绝）")
     e.add_argument("--json", action="store_true")
 
     e2 = sub.add_parser("eval", help="跑标注测试集")

@@ -61,21 +61,22 @@ python scripts/fetch_text.py video <抖音/B站链接> --out-dir C:\Temp\distill
 
 ## 校验器在查什么
 
-`audit.py verify` 九类检查，任何一条 ERROR 都会阻止写盘：
+`audit.py verify` 十类检查，任何一条 ERROR 都会阻止写盘：
 
 | 检查 | 拦的是什么 |
 |---|---|
 | LOC-EXISTS | 定位符指向的位置原文里不存在 |
 | QUOTE-MISSING | 只有位置、没有逐字引文 |
 | QUOTE-HIT | 引文在该定位范围内找不到（差一个字也算） |
+| MALFORMED | 写成 `[p.9 Table 3 行 A]` 这种语法不合法的标注 —— 最阴的一条：报告上看着有锚点，实际没被检查 |
 | BIDIR | 正文锚点和文末定位表对不上 |
 | LEVEL | `{S}` 结论放进了「我的判断」节，或 `{I}` 混进结论 |
-| COARSE | 长结论挂在很粗的锚点上（整页/整段却只有一句引文） |
+| COARSE | 长结论挂在很粗的锚点上（整页/整段却只有一句引文）。脚注与跨页区间不报 |
 | THIN | 空节、灌水节 |
 | SCHEMA | frontmatter 缺字段或类型不对 |
 | CLAIM | 声明的字数/覆盖度与实际不符 |
 
-自带三个标注用例，`python scripts/audit.py eval eval/cases` 可跑。用例判定的是「校验器行为符不符合预期」，不是「报告写得对不对」。
+自带五个标注用例（图文正/反例、视频、页节定位、定位错误反例），`python scripts/audit.py eval eval/cases` 可跑。用例判定的是「校验器行为符不符合预期」，不是「报告写得对不对」。
 
 ## 旧笔记升级
 
@@ -86,7 +87,13 @@ python scripts/audit.py upgrade 旧笔记.md --src content.md          # 只列�
 python scripts/audit.py upgrade 旧笔记.md --src content.md --apply  # 回填高于阈值的
 ```
 
-候选按「结论与候选句的字面重合度」排序。**它只解决找句子的体力活，语义是否真支撑那条结论必须人判断**——这是工具的边界，写在 `references/audit-protocol.md` 里。
+候选按「结论与候选句的字面重合度」排序。三个要知道的点：
+
+- **页级锚点会先自动降到节级**（`[p.7]` → `[p.7 §5.1]`）再挑句子。一页三千字挑不出支撑句，一节两百字才行。
+- **跨语言直接拒绝**（`E_CROSSLANG`）。中文结论 + 英文原文时，字面重合全是巧合 —— 实测挑出来的是会议名、页脚、`During inference,` 这种。这种情况只能人工挑，加 `--force` 才绕过。
+- **引文是机器挑的就要说出来**。回填后跑一遍 verify，交付时标明哪些是机器挑的、哪些人工确认过。
+
+**它只解决找句子的体力活，语义是否真支撑那条结论必须人判断**——这是工具的边界，写在 `references/audit-protocol.md` 里。
 
 ## 三个坑（都踩过）
 
